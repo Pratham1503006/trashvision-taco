@@ -202,8 +202,8 @@ def box_refinement_graph(box, gt_box, dtype_str):
 
     dy = (gt_center_y - center_y) / height
     dx = (gt_center_x - center_x) / width
-    dh = tf.log(gt_height / height)
-    dw = tf.log(gt_width / width)
+    dh = tf.math.log(gt_height / height)
+    dw = tf.math.log(gt_width / width)
 
     result = tf.stack([dy, dx, dh, dw], axis=1)
     return result
@@ -757,8 +757,8 @@ def minimize_mask(bbox, mask, mini_shape):
         m = m[y1:y2, x1:x2]
         if m.size == 0:
             raise Exception("Invalid bounding box with area of zero")
-        # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, mini_shape, order=1, mode="constant")
+        # Resize with bilinear interpolation (cast to float first)
+        m = skimage.transform.resize(m.astype(float), mini_shape, order=1, mode="constant")
         mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
@@ -1045,11 +1045,15 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
 
     outputs = []
     for i in range(batch_size):
-        inputs_slice = [x[i] for x in inputs]
+        # Use tf.gather to slice - works in eager mode
+        inputs_slice = [tf.gather(x, [i]) for x in inputs]
+        # Remove batch dimension (squeeze first dim)
+        inputs_slice = [tf.squeeze(x, axis=0) for x in inputs_slice]
         output_slice = graph_fn(*inputs_slice)
         if not isinstance(output_slice, (tuple, list)):
             output_slice = [output_slice]
         outputs.append(output_slice)
+    
     # Change outputs from a list of slices where each is
     # a list of outputs to a list of outputs and each has
     # a list of slices
@@ -1058,8 +1062,7 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
     if names is None:
         names = [None] * len(outputs)
 
-    result = [tf.stack(o, axis=0, name=n)
-              for o, n in zip(outputs, names)]
+    result = [tf.stack(o, axis=0, name=n) for o, n in zip(outputs, names)]
     if len(result) == 1:
         result = result[0]
 

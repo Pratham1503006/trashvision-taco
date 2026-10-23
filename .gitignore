@@ -1,1 +1,22 @@
 data/batch_*
+
+# Derived dataset splits (regenerate with detector/split_dataset.py)
+data/annotations_*_train.json
+data/annotations_*_val.json
+data/annotations_*_test.json
+
+# Virtual environments
+taco_venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Model checkpoints (too large for GitHub - share via Releases or Drive)
+*.pth
+*.pt
+*.h5
+
+# Training logs
+detector/train.log

@@ -24,17 +24,13 @@ import multiprocessing
 import numpy as np
 import skimage.transform
 import tensorflow as tf
-import keras
-import keras.backend as K
-import keras.layers as KL
-import keras.engine as KE
-import keras.models as KM
+import tensorflow.keras as keras
+import tensorflow.keras.backend as K
+import tensorflow.keras.layers as KL
+import tensorflow.keras.models as KM
 import utils
 
-# Requires TensorFlow 1.3+ and Keras 2.0.8+.
-from distutils.version import LooseVersion
-assert LooseVersion(tf.__version__) >= LooseVersion("1.3")
-assert LooseVersion(keras.__version__) >= LooseVersion('2.0.8')
+KE = KL
 
 
 ############################################################
@@ -345,7 +341,7 @@ class ProposalLayer(KE.Layer):
 def log2_graph(x):
     tensor_dtype = tf.float16 if K.floatx() != 'float32' else tf.float32
     """Implementatin of Log2. TF doesn't have a native implemenation."""
-    return tf.log(x) / tf.log(tf.constant(2.0, dtype=tensor_dtype))
+    return tf.math.log(x) / tf.math.log(tf.constant(2.0, dtype=tensor_dtype))
 
 
 class PyramidROIAlign(KE.Layer):
@@ -563,12 +559,12 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Positive ROIs
     positive_count = int(config.TRAIN_ROIS_PER_IMAGE *
                          config.ROI_POSITIVE_RATIO)
-    positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
+    positive_indices = tf.random.shuffle(positive_indices)[:positive_count]
     positive_count = tf.shape(positive_indices)[0]
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
     negative_count = tf.cast(r * tf.cast(positive_count, tensor_ftype), tf.int32) - positive_count
-    negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
+    negative_indices = tf.random.shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
     positive_rois = tf.gather(proposals, positive_indices)
     negative_rois = tf.gather(proposals, negative_indices)
@@ -990,8 +986,9 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
     x = KL.TimeDistributed(KL.Dense(num_classes * 4, activation='linear'),
                            name='mrcnn_bbox_fc')(shared)
     # Reshape to [batch, boxes, num_classes, (dy, dx, log(dh), log(dw))]
-    s = K.int_shape(x)
-    mrcnn_bbox = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
+    # Use dynamic shape for Keras 3 compatibility
+    mrcnn_bbox = KL.Lambda(lambda x: tf.reshape(x, (tf.shape(x)[0], tf.shape(x)[1], num_classes, 4)),
+                           name="mrcnn_bbox")(x)
 
     return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
 
@@ -1872,6 +1869,11 @@ def data_generator(dataset, config, shuffle=True, augmentation=None,
                 inputs = [batch_images, batch_image_meta, batch_rpn_match, batch_rpn_bbox,
                           batch_gt_class_ids, batch_gt_boxes, batch_gt_masks]
                 outputs = []
+                # Keras requires one target array per loss output. All losses
+                # are already computed in-graph as Lambda layer outputs, so
+                # these dummy targets are ignored by the loss functions.
+                outputs.extend(
+                    [np.zeros((batch_size,), dtype=np.float32)] * 5)
 
                 if random_rois:
                     inputs.extend([batch_rpn_rois])
@@ -1883,7 +1885,7 @@ def data_generator(dataset, config, shuffle=True, augmentation=None,
                         outputs.extend(
                             [batch_mrcnn_class_ids, batch_mrcnn_bbox, batch_mrcnn_mask])
 
-                yield inputs, outputs
+                yield tuple(inputs), tuple(outputs)
 
                 # start a new batch
                 b = 0
@@ -1958,9 +1960,9 @@ class MaskRCNN():
             # [batch, MAX_GT_INSTANCES, (y1, x1, y2, x2)] in image coordinates
             input_gt_boxes = KL.Input(
                 shape=[None, 4], name="input_gt_boxes", dtype=dtype)
-            # Normalize coordinates
+            # Normalize coordinates - combine image_shape and norm in one Lambda
             gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(
-                x, K.shape(input_image)[1:3]))(input_gt_boxes)
+                x[0], K.shape(x[1])[1:3]), output_shape=lambda s: s[0])([input_gt_boxes, input_image])
 
             # 3. GT Masks (zero padded)
             # [batch, height, width, MAX_GT_INSTANCES]
@@ -2014,8 +2016,8 @@ class MaskRCNN():
             # Duplicate across the batch dimension because Keras requires it
             # TODO: can this be optimized to avoid duplicating the anchors?
             anchors = np.broadcast_to(anchors, (config.BATCH_SIZE,) + anchors.shape)
-            # A hack to get around Keras's bad support for constants
-            anchors = KL.Lambda(lambda x: tf.Variable(anchors,dtype=dtype), name="anchors")(input_image)
+            # Use a constant tensor (Keras 3 compatibility)
+            anchors = tf.constant(anchors, dtype=dtype)
         else:
             anchors = input_anchors
 
@@ -2059,9 +2061,9 @@ class MaskRCNN():
                 # Ignore predicted ROIs and use ROIs provided as an input.
                 input_rois = KL.Input(shape=[config.POST_NMS_ROIS_TRAINING, 4],
                                       name="input_roi", dtype=np.int32)
-                # Normalize coordinates
+                # Normalize coordinates - combine in one Lambda
                 target_rois = KL.Lambda(lambda x: norm_boxes_graph(
-                    x, K.shape(input_image)[1:3]))(input_rois)
+                    x[0], K.shape(x[1])[1:3]), output_shape=lambda s: s[0])([input_rois, input_image])
             else:
                 target_rois = rpn_rois
 
@@ -2207,16 +2209,16 @@ class MaskRCNN():
         """Modified version of the correspoding Keras function with
         the addition of multi-GPU support and the ability to exclude
         some layers from loading.
-        exlude: list of layer names to excluce
+        exlude: list of layer names to exclude
         """
         import h5py
-        from keras.engine import topology
 
         if exclude:
             by_name = True
 
         if h5py is None:
             raise ImportError('`load_weights` requires h5py.')
+
         f = h5py.File(weights_in_path, mode='r')
         if 'layer_names' not in f.attrs and 'model_weights' in f:
             f = f['model_weights']
@@ -2227,14 +2229,35 @@ class MaskRCNN():
         layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model")\
             else keras_model.layers
 
-        # Exclude some layers
-        if exclude:
-            layers = filter(lambda l: l.name not in exclude, layers)
-
         if by_name:
-            topology.load_weights_from_hdf5_group_by_name(f, layers)
+            # Build a map of layer names to layers
+            layer_map = {l.name: l for l in layers}
+
+            # Load weights by name, skipping excluded or mismatched layers
+            for name in f.attrs['layer_names']:
+                if exclude and name in exclude:
+                    continue
+                if name not in layer_map:
+                    continue
+                layer = layer_map[name]
+                g = f[name]
+                weight_names = [n.decode('utf8') for n in g.attrs['weight_names']] if 'weight_names' in g.attrs else []
+                if not weight_names:
+                    continue
+                weight_values = [np.array(g[wn]) for wn in weight_names]
+                layer_weights = layer.get_weights()
+                # Only load if shapes match
+                if len(layer_weights) == len(weight_values):
+                    shapes_match = all(lw.shape == wv.shape for lw, wv in zip(layer_weights, weight_values))
+                    if shapes_match:
+                        layer.set_weights(weight_values)
+                    else:
+                        print(f"Skipping layer '{name}': shape mismatch")
+                else:
+                    print(f"Skipping layer '{name}': weight count mismatch")
         else:
-            topology.load_weights_from_hdf5_group(f, layers)
+            self.keras_model.load_weights(weights_in_path)
+
         if hasattr(f, 'close'):
             f.close()
         # Update the log directory
@@ -2244,7 +2267,7 @@ class MaskRCNN():
         """Downloads ImageNet trained weights from Keras.
         Returns path to weights file.
         """
-        from keras.utils.data_utils import get_file
+        from tensorflow.keras.utils import get_file
         TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
                                  'releases/download/v0.2/'\
                                  'resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5'
@@ -2261,52 +2284,47 @@ class MaskRCNN():
 
         # Optimizer object
         if self.config.OPTIMIZER == 'SGD':
-            optimizer = keras.optimizers.SGD(
-                lr=learning_rate, momentum=momentum, clipnorm=self.config.GRADIENT_CLIP_NORM)
+            optimizer = tf.keras.optimizers.SGD(
+                learning_rate=learning_rate, momentum=momentum, clipnorm=self.config.GRADIENT_CLIP_NORM)
         else:
-            optimizer = keras.optimizers.Adam(
-                lr=learning_rate, amsgrad=True, clipnorm=self.config.GRADIENT_CLIP_NORM)
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=learning_rate, amsgrad=True, clipnorm=self.config.GRADIENT_CLIP_NORM)
 
-        # Add Losses
-        # First, clear previously set losses to avoid duplication
-        self.keras_model._losses = []
-        self.keras_model._per_input_losses = {}
+        # Compile with custom losses for the loss output layers
+        # The loss layers (rpn_class_loss, etc.) are already computed by Lambda layers
+        # and included as model outputs. We use a loss function that returns y_pred.
         loss_names = [
             "rpn_class_loss",  "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
-        for name in loss_names:
-            layer = self.keras_model.get_layer(name)
-            if layer.output in self.keras_model.losses:
-                continue
-            loss = (
-                tf.reduce_mean(layer.output, keepdims=True)
-                * self.config.LOSS_WEIGHTS.get(name, 1.))
-            self.keras_model.add_loss(loss)
 
-        tensor_dtype = tf.float32
+        # Build loss dict: for loss outputs, use a function that returns y_pred (the computed loss)
+        loss_dict = {}
+        for name in loss_names:
+            loss_dict[name] = lambda y_true, y_pred: y_pred
+
         # Add L2 Regularization
-        # Skip gamma and beta weights of batch normalization layers.
+        tensor_dtype = tf.float32
         reg_losses = [
-            keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(w), tensor_dtype)
+            tf.keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(w), tensor_dtype)
             for w in self.keras_model.trainable_weights
             if 'gamma' not in w.name and 'beta' not in w.name]
-        self.keras_model.add_loss(tf.add_n(reg_losses))
+        # Skip regularization for now (add_loss not supported in new Keras)
+        # if reg_losses:
+        #     reg_loss = tf.add_n(reg_losses)
+        #     self.keras_model.add_loss(reg_loss)
 
         # Compile
         self.keras_model.compile(
             optimizer=optimizer,
-            loss=[None] * len(self.keras_model.outputs))
+            loss=loss_dict)
 
-        # Add metrics for losses
-        for name in loss_names:
-            if name in self.keras_model.metrics_names:
-                continue
-            layer = self.keras_model.get_layer(name)
-            self.keras_model.metrics_names.append(name)
-            loss = (
-                tf.reduce_mean(layer.output, keepdims=True)
-                * self.config.LOSS_WEIGHTS.get(name, 1.))
-            self.keras_model.metrics_tensors.append(loss)
+        # Add metrics for losses (new Keras doesn't support metrics_tensors)
+        # for name in loss_names:
+        #     if name in self.keras_model.metrics_names:
+        #         continue
+        #     self.keras_model.metrics_names.append(name)
+        #     self.keras_model.metrics_tensors.append(
+        #         self.keras_model.get_layer(name).output * self.config.LOSS_WEIGHTS.get(name, 1.))
 
     def set_trainable(self, layer_regex, keras_model=None, indent=0, verbose=1):
         """Sets model layers as trainable if their names match
@@ -2366,7 +2384,7 @@ class MaskRCNN():
                 self.config.NAME.lower(), now))
 
         # Path to save after each epoch. Include placeholders that get filled by Keras.
-        self.checkpoint_path = os.path.join(self.log_dir, "mask_rcnn_{}_*epoch*.h5".format(
+        self.checkpoint_path = os.path.join(self.log_dir, "mask_rcnn_{}_*epoch*.weights.h5".format(
             self.config.NAME.lower()))
         self.checkpoint_path = self.checkpoint_path.replace(
             "*epoch*", "{epoch:04d}")
@@ -2425,9 +2443,9 @@ class MaskRCNN():
 
         # Callbacks
         callbacks = [
-            keras.callbacks.TensorBoard(log_dir=self.log_dir,
+            tf.keras.callbacks.TensorBoard(log_dir=self.log_dir,
                                         histogram_freq=0, write_graph=True, write_images=False),
-            keras.callbacks.ModelCheckpoint(self.checkpoint_path,
+            tf.keras.callbacks.ModelCheckpoint(self.checkpoint_path,
                                             verbose=0, save_weights_only=True),
         ]
 
@@ -2445,7 +2463,7 @@ class MaskRCNN():
         else:
             workers = multiprocessing.cpu_count()
 
-        self.keras_model.fit_generator(
+        self.keras_model.fit(
             train_generator,
             initial_epoch=self.epoch,
             epochs=epochs,
@@ -2453,9 +2471,6 @@ class MaskRCNN():
             callbacks=callbacks,
             validation_data=val_generator,
             validation_steps=self.config.VALIDATION_STEPS,
-            max_queue_size=100,
-            workers=workers,
-            use_multiprocessing=True,
         )
         self.epoch = max(self.epoch, epochs)
 

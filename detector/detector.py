@@ -248,13 +248,19 @@ if __name__ == '__main__':
     if args.command == "train":
         class TacoTrainConfig(Config):
             NAME = "taco"
-            IMAGES_PER_GPU = 2
+            IMAGES_PER_GPU = 1
+            IMAGE_MIN_DIM = 512
+            IMAGE_MAX_DIM = 512
             GPU_COUNT = 1
             STEPS_PER_EPOCH = min(1000,int(dataset_train.num_images/(IMAGES_PER_GPU*GPU_COUNT)))
             USE_MINI_MASK = True
-            MINI_MASK_SHAPE = (512, 512)
+            MINI_MASK_SHAPE = (128, 128)
             NUM_CLASSES = nr_classes
             LEARNING_RATE = args.lrate
+            TRAIN_ROIS_PER_IMAGE = 64
+            MAX_GT_INSTANCES = 50
+            DETECTION_MAX_INSTANCES = 50
+            TRAIN_BN = False
         config = TacoTrainConfig()
     else:
         class TacoTestConfig(Config):
